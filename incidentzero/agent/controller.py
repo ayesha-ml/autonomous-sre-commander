@@ -18,11 +18,7 @@ from .state import AgentState
 
 
 class AgentController:
-    """Baseline controller derived from the class 'first agent' loop.
-
-    It intentionally lacks production reliability. Your assignment is to evolve this
-    controller rather than replacing it with an agent framework.
-    """
+    """Controller enforcing loop guarding, human approvals, budget limits, and replanning."""
 
     def __init__(
         self,
@@ -45,31 +41,58 @@ class AgentController:
         self.retry_policy = RetryPolicy()
 
     def _model_decide(self) -> ModelReply:
-        # TODO(A1): integrate bounded retries, budget accounting and trace metrics.
-        self.budget.consume_llm()
-        return self.model.decide(self.state.messages, self.tools.groq_tools)
+        # executing model decision with exponential retry backoff
+        def _call() -> ModelReply:
+            self.budget.consume_llm()
+            return self.model.decide(self.state.messages, self.tools.groq_tools)
+
+        return self.retry_policy.call_model(_call)
 
     def _execute_tool_call(self, call: ToolCall) -> dict[str, Any]:
-        """Validate, approve if needed, execute, trace, and return one observation.
-
-        The baseline only validates and executes. Students must add:
-        - malformed-call recovery,
-        - approval for high/critical actions,
-        - loop detection,
-        - budget-aware behavior,
-        - stale-precondition handling,
-        - retryable tool-error handling where appropriate.
-        """
+        """Validate, approve, execute, trace, and return observation."""
         self.budget.consume_tool()
+
+        # checking for repetitive tool action loops
+        if self.loop_guard.record(call.name, call.arguments):
+            return {
+                "status": "loop_detected",
+                "tool": call.name,
+                "world_version": self.state.latest_world_version,
+                "evidence_id": None,
+                "data": None,
+                "retryable": False,
+                "message": f"Loop detected for action {call.name}",
+            }
+
+        # validating tool call schema arguments
         ok, error = self.tools.validate(call.name, call.arguments)
         if not ok:
             return {
-                "status": "validation_error", "tool": call.name,
-                "world_version": self.tools.environment.world_version,
-                "evidence_id": None, "data": None,
-                "retryable": False, "message": error,
+                "status": "validation_error",
+                "tool": call.name,
+                "world_version": self.state.latest_world_version,
+                "evidence_id": None,
+                "data": None,
+                "retryable": False,
+                "message": error,
             }
-        # TODO(A1): ask self.approval before high/critical actions. The LLM cannot approve itself.
+
+        # requesting human approval for high and critical risk actions
+        if self.risk.requires_human_approval(call.name):
+            approved = self.approval.request_approval(call.name, call.arguments)
+            if not approved:
+                return {
+                    "status": "approval_denied",
+                    "tool": call.name,
+                    "world_version": self.state.latest_world_version,
+                    "evidence_id": None,
+                    "data": None,
+                    "retryable": False,
+                    "approved": False,
+                    "message": f"Human approval denied for action {call.name}",
+                }
+
+        # executing tool and logging trace
         result = self.tools.execute(call.name, call.arguments)
         self.trace.record("tool_result", {"call": {"name": call.name, "arguments": call.arguments}, "result": result})
         return result
@@ -100,27 +123,37 @@ class AgentController:
             {"role": "user", "content": "Investigate the active production incident, mitigate it safely, verify recovery, then close it; otherwise escalate with evidence."},
         ]
         try:
-            # Bootstrap with one real observation so the plan is based on environment evidence.
+            # bootstrapping incident observation from environment
             self.budget.consume_tool()
             incident = self.tools.execute("get_incident", {})
             self.state.observe_result(incident)
             self.trace.record("bootstrap_incident", incident)
             self.state.messages.append({"role": "system", "content": f"Current incident evidence: {json.dumps(incident)}"})
 
+            # generating initial structured plan
             self.budget.consume_llm()
             self.state.plan = self.planner.create(incident)
             self.trace.record("plan_created", {"plan": str(self.state.plan)})
 
-            # Deliberately simple baseline loop. A correct submission must be substantially stronger.
+            # running main controller execution loop
             while self.budget.remaining_llm > 0 and self.budget.remaining_tools > 0:
                 reply = self._model_decide()
                 self._append_assistant(reply)
-                self.trace.record("model_reply", {"content": reply.content, "tool_calls": [c.__dict__ if hasattr(c, "__dict__") else {"name": c.name, "arguments": c.arguments} for c in reply.tool_calls]})
+                self.trace.record(
+                    "model_reply",
+                    {
+                        "content": reply.content,
+                        "tool_calls": [
+                            c.__dict__ if hasattr(c, "__dict__") else {"name": c.name, "arguments": c.arguments}
+                            for c in reply.tool_calls
+                        ],
+                    },
+                )
 
                 if not reply.tool_calls:
                     return AgentOutcome(
                         status="failed",
-                        summary="Model stopped without a tool call; baseline controller cannot prove resolution.",
+                        summary="Model stopped without a tool call; controller cannot prove resolution.",
                         llm_calls=self.budget.llm_calls,
                         tool_calls=self.budget.tool_calls,
                         final_world_version=self.state.latest_world_version,
@@ -128,18 +161,27 @@ class AgentController:
                         trace_path=str(self.trace.path),
                     )
 
-                # Starter executes only the first call. Parallel calls are disabled in Groq config.
                 call = reply.tool_calls[0]
                 result = self._execute_tool_call(call)
                 self.state.observe_result(result)
                 self._append_tool_result(call, result)
 
+                # returning terminal outcome on successful close or escalation
                 if call.name == "close_incident" and result.get("status") == "ok":
                     return AgentOutcome("resolved", "Incident closed with simulator evidence.", self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
                 if call.name == "escalate_incident" and result.get("status") == "ok":
                     return AgentOutcome("escalated", "Incident escalated with evidence.", self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
 
-                # TODO(A1): distinguish retry, re-plan, abort, verify, and continue.
+                # triggering plan revision if tool output indicates failure or state mismatch
+                if self.replan_policy.should_replan(result):
+                    try:
+                        self.budget.consume_llm()
+                        summary = f"World version: {self.state.latest_world_version}, Evidence count: {len(self.state.evidence_ids)}"
+                        self.state.plan = self.planner.revise(self.state.plan, result, summary)
+                        self.trace.record("plan_revised", {"plan": str(self.state.plan)})
+                        self.state.messages.append({"role": "system", "content": f"Plan updated after issue: {json.dumps(result)}"})
+                    except BudgetExceeded:
+                        break
 
             return AgentOutcome("budget_exhausted", "Agent budget exhausted before safe termination.", self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
         except BudgetExceeded as exc:

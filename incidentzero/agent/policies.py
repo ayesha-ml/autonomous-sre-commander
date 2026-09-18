@@ -20,8 +20,16 @@ class RiskPolicy:
 
 class ReplanPolicy:
     def should_replan(self, tool_result: dict[str, Any]) -> bool:
-        # TODO(A1): stale state, denied approval, non-retryable action failure,
-        # contradictory evidence and verified non-recovery should not all be treated the same.
+        status = str(tool_result.get("status", "")).lower()
+
+        # checking for stale state, denied approval, or failed verification
+        if status in {"stale_precondition", "approval_denied", "verification_failed"}:
+            return True
+
+        # checking for non retryable action failures
+        if tool_result.get("retryable") is False and status not in {"ok", "success", ""}:
+            return True
+
         return False
 
 
@@ -32,5 +40,10 @@ class LoopGuard:
 
     def record(self, action_name: str, arguments: dict[str, Any]) -> bool:
         """Return True when the exact same action has repeated too often."""
-        # TODO(A1): create a stable action fingerprint and detect looping.
-        return False
+        # creating deterministic fingerprint for action and arguments
+        serialized_args = json.dumps(arguments, sort_keys=True)
+        fingerprint = f"{action_name}:{serialized_args}"
+
+        # tracking execution count and checking against repeat threshold
+        self._counts[fingerprint] = self._counts.get(fingerprint, 0) + 1
+        return self._counts[fingerprint] > self.max_same_action_repeats
